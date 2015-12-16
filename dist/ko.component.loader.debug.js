@@ -16,14 +16,24 @@
     ko.componentLoader = buildLoader(undefined, exports);
     ko.bindingHandlers.attached = { init: attachedInit };
     ko.bindingHandlers.attachedHandler = { init: attachedHandlerInit };
+    ko.extenders.ref = function (target, option) { target.ref = option; return target; };
+    
     return;
 
     function attachedInit(element, valueAccessor, allBindings, viewModel, bindingContext)
     {
         if (valueAccessor() === 'parent')
             element = element.parentNode;
-        if (viewModel.attached) viewModel.attached(element);
-        if (ko.componentLoader) ko.componentLoader.onComponentAttached(viewModel);
+
+        var ref;
+        if (viewModel.attached)
+            ref = viewModel.attached(element);  // calls component's attached method
+
+        if (ref && ref !== ko.componentLoader.ref)
+            ko.componentLoader.onComponentAttached(viewModel, ref);  // internally tracks outstanding components
+
+        if (ref && ref.constructor === Reference)
+            ref.attached(viewModel);    // updates reference counts
     }
 
     function attachedHandlerInit(element, valueAccessor)
@@ -40,13 +50,15 @@
         self.components = ko.observableArray([]);
         self.root = ko.observable();
         self.dialogs = ko.observableArray([]);
+        self.ref = new Reference().setOptions({ completedCallback: onRefCompleted, componentName: 'ko.component.loader' });
 
         self.addComponent = addComponent;
         self.onComponentAttached = onComponentAttached;
-        self.buildLoader = buildLoader;
         self.setLoadedCallback = setLoadedCallback;
         self.setOptions = setOptions;
-        self.resetAsDefault = resetAsDefault;
+        self.attached = function () { return self.ref; };
+        self.isVerbose = function () { return verbose; };
+        self.Reference = Reference;
 
         if (typeof xOptions === "object")
             setOptions(xOptions);
@@ -57,55 +69,59 @@
         function addComponent(path, options)
         {
             options = options || {};
+            options.params = options.params || {};
 
             var name = path.replace(/^.*\//, '');
             name = camelCaseToDash(name);
 
             ko.components.register(name, { require: path });
 
-            var component = { name: name, path: path, isLoaded: false, noWait: options.noWait ? true: false };
+            var component = { name: name, params: options.params, path: path, isLoaded: false, noWait: options.noWait ? true : false, root: options.root ? true : false };
             self.components.push(component);
 
+            if (options.root || options.dialog)
+                options.params.ref = options.params.ref || self.ref.child();    // builds ref for anything bound by loader
+            
             if (options.root)
-                self.root({ name: name, params: options.params || {} });
+                self.root(component);
             else if (options.dialog)
-                self.dialogs.push({ name: name, params: options.params || {} });
+                self.dialogs.push(component);
         }
 
-        function onComponentAttached(viewModel)
+        function onComponentAttached(viewModel, ref)
         {
             var name = viewModel.constructor.name || viewModel.constructor.toString().match(/function (\w*)/)[1];
             name = camelCaseToDash(name);
 
             var component = findComponent(name);
-            if (!component)
-            {
-                if (verbose) console.log('Component not found. Ignoring attached event for component ' + name);
-                return;
-            }
+            if (!component && verbose) console.log('Component not found. Ignoring attached event for component ' + name);
+            if (!component) return;
+            
             component.isLoaded = true;
-            component.viewModel = viewModel;
+            component.viewModel = viewModel;            
             if (verbose) console.log('Loaded component ' + name + '\tOutstanding ' + retrieveOutstanding().join());
-
-            if (!self.loading()) return;
-            var loaded = isAllLoaded();
-            if (!loaded)
-                return;
-
-            if (verbose) console.log('Page ready');
-            var root = findRoot();
-            if (loadedCallback)
-                self.loading(loadedCallback(self) || false);
-            else if (root && root.viewModel && typeof root.viewModel.handleOnLoaded === "function")
-                self.loading(root.viewModel.handleOnLoaded(self) || false);
-            else
-                self.loading(false);
+            if (ref && !ref.componentName) ref.setComponentName(name);
         }
 
-        function findRoot()
+        function onRefCompleted()
         {
+            if (verbose) console.log('Reference counts are completed');
+
+            if (!self.loading()) return;
+
+            if (verbose) console.log('All loaded');
+            window.setTimeout(doLoaded, 0);     // assures loading is done by putting at back of call queue            
+        }
+                
+        function doLoaded()
+        {
+            self.loading(false);                                // makes visible before callback
+            if (verbose) console.log('Page ready');
             var root = self.root();
-            return (!root || !root.name) ? null : findComponent(root.name);
+            if (loadedCallback)
+                loadedCallback(self);
+            else if (root && root.viewModel && typeof root.viewModel.handleOnLoaded === "function")
+                root.viewModel.handleOnLoaded(self);
         }
 
         function findComponent(name)
@@ -118,11 +134,6 @@
                     return component;
             }
             return null;
-        }
-
-        function isAllLoaded()
-        {
-            return retrieveOutstanding().length === 0;
         }
 
         function retrieveOutstanding()
@@ -142,18 +153,10 @@
 
         function setOptions(options)
         {
+            if (options.headLess) self.ref.attached(self);      // loader isn't bound using KO
             if (typeof options.verbose !== "undefined") verbose = options.verbose ? true : false;
-            if (typeof options.loadedCallback !== "undefined") loadedCallback = options.loadedCallback;
-        }
-
-        function resetAsDefault()
-        {
-            ko.componentLoader = self;
-            self.loading(true);
-
-            var components = self.components();
-            for (var i = 0; i < components.length; i++)
-                components[i].isLoaded = false;
+            if (typeof options.loadedCallback === "function") loadedCallback = options.loadedCallback;
+            return self;
         }
 
         function camelCaseToDash(text)
@@ -173,4 +176,93 @@
             return result;
         }
     }
+    
+    function Reference(parent)
+    {
+        var self = this;
+        var initialCompleted = false;
+        var isAttached = false;
+        var children = 0;
+        var childrenComplete = 0;
+        var completedCallback = ko.observable(self);
+        var subscriptions = [];
+
+        self.child = child;
+        self.attached = attached;
+        self.setComponentName = setComponentName;
+        self.setOptions = setOptions;
+        self.addCompletedCallback = addCompletedCallback;
+        self.childCompleted = childCompleted;
+        self.refForItem = refForItem;
+        self.instance = function () { return self.viewModel; };
+        self.dispose = dispose;
+
+        return self;
+        
+        function child(args)
+        {
+            children++;
+            return new Reference(self).setOptions(args || {});
+        }
+        
+        function setOptions(args)
+        {
+            if (args.completedCallback) addCompletedCallback(args.completedCallback);
+            if (args.componentName) setComponentName(args.componentName);
+            return self;
+        }
+        
+        function setComponentName(name) 
+        { 
+            self.componentName = name;
+            return self;
+        }
+        
+        function addCompletedCallback(callback)
+        {
+            var subscription = completedCallback.subscribe(function () { callback(self.viewModel, self); });
+            subscriptions.push(subscription);
+            return subscription;
+        }
+        
+        function dispose()
+        {
+            subscriptions.forEach(function (sub) { sub.dispose(); });
+            subscriptions.length = 0;
+            self.instance(null);
+            parent = null;
+        }
+        
+        function attached(viewModel)
+        {
+            isAttached = true;
+            self.viewModel = viewModel;
+            notify();
+        }
+        
+        function childCompleted()
+        {
+            childrenComplete++;
+            notify();
+        }
+        
+        function notify()
+        {
+            if (ko.componentLoader.isVerbose()) console.log('Notify ' + self.componentName + ' isAttached=' + isAttached + ' children=' + children + ' complete=' + childrenComplete);            
+            if (!isAttached || childrenComplete !== children || initialCompleted)
+                return;
+
+            initialCompleted = true;
+            completedCallback(self);
+
+            if (parent)
+                parent.childCompleted();
+        }
+        
+        function refForItem(item)
+        {
+            item.ref = item.ref || self.child();
+            return item.ref;
+        }
+    }    
 }));
