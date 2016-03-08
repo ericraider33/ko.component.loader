@@ -94,7 +94,7 @@
             name = camelCaseToDash(name);
 
             var component = findComponent(name);
-            if (!component && verbose) console.log('Component not found. Ignoring attached event for component ' + name);
+            if (!component && verbose && self.components().length) console.log('Component not found. Ignoring attached event for component ' + name);
             if (!component) return;
             
             component.isLoaded = true;
@@ -194,6 +194,7 @@
         self.addCompletedCallback = addCompletedCallback;
         self.childCompleted = childCompleted;
         self.refForItem = refForItem;
+        self.refWrap = refWrap;
         self.instance = function () { return self.viewModel; };
         self.dispose = dispose;
 
@@ -263,6 +264,12 @@
         {
             item.ref = item.ref || self.child();
             return item.ref;
+        }
+        
+        function refWrap(item)
+        {
+            item.ref = item.ref || self.child();
+            return item;
         }
     }    
 }));
