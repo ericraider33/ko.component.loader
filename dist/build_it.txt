@@ -1,0 +1,1 @@
+c:\dev\ko.component.loader\dist>C:\dev\asclepius\source\support\node\node_modules\.bin\uglifyjs.cmd ko.component.loader.debug.js > ko.component.loader.min.js

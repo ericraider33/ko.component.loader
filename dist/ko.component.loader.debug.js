@@ -44,7 +44,7 @@
 
     function buildLoader(xOptions, xExports)
     {
-        var self = xExports || {}, loadedCallback, verbose;
+        var self = xExports || {}, loadedCallback, verbose, amdDefine;
 
         self.loading = ko.observable(true);
         self.components = ko.observableArray([]);
@@ -59,6 +59,7 @@
         self.attached = function () { return self.ref; };
         self.isVerbose = function () { return verbose; };
         self.Reference = Reference;
+        self.initComponentDefine = initComponentDefine;
 
         if (typeof xOptions === "object")
             setOptions(xOptions);
@@ -71,21 +72,50 @@
             options = options || {};
             options.params = options.params || {};
 
-            var name = path.replace(/^.*\//, '');
-            name = camelCaseToDash(name);
+            var name = options.name || camelCaseToDash(path.replace(/^.*\//, ''));
+            var component = findComponent(name);
 
-            ko.components.register(name, { require: path });
+            if (component)
+            {
+                component.path = component.path || path;
+                component.noWait = typeof options.noWait !== "undefined" ? options.noWait : component.noWait;
+                component.root = typeof options.root !== "undefined" ? options.root : component.root;
+                component.dialog = typeof options.dialog !== "undefined" ? options.dialog : component.dialog;
+                component.params = $.extend(component.params, options.params);
+            }
+            else
+            {
+                component = { name: name, params: options.params, path: path, isLoaded: false, noWait: !!options.noWait, root: !!options.root, registered: false, dialog: options.dialog };
+                self.components.push(component);
+            }
 
-            var component = { name: name, params: options.params, path: path, isLoaded: false, noWait: options.noWait ? true : false, root: options.root ? true : false };
-            self.components.push(component);
+            if (component.path && !component.registered)
+            {
+                ko.components.register(name, { require: component.path });
+                component.registered = true;
+            }
 
-            if (options.root || options.dialog)
-                options.params.ref = options.params.ref || self.ref.child();    // builds ref for anything bound by loader
+            if ((component.root || component.dialog) && !component.params.ref)
+                component.params.ref = self.ref.child();    // builds ref for anything bound by loader
             
-            if (options.root)
+            if (component.root && self.root() !== component)
                 self.root(component);
-            else if (options.dialog)
+            else if (component.dialog && self.dialogs.indexOf(component) < 0)
                 self.dialogs.push(component);
+        }
+
+        function registerComponentPath(path)
+        {
+            var name = camelCaseToDash(path.replace(/^.*\//, ''));
+            var component = findComponent(name);
+            if (!component || component.registered)
+                return;
+
+            component.path = path;
+            ko.components.register(name, { require: path });
+            component.registered = true;
+
+            if (verbose) console.log('Registered path ' + path + ' for component ' + name);
         }
 
         function onComponentAttached(viewModel, ref)
@@ -126,14 +156,7 @@
 
         function findComponent(name)
         {
-            var components = self.components();
-            for (var i = 0; i < components.length; i++)
-            {
-                var component = components[i];
-                if (component.name == name)
-                    return component;
-            }
-            return null;
+            return self.components().filter(function (c) { return c.name === name; })[0];
         }
 
         function retrieveOutstanding()
@@ -175,6 +198,59 @@
             }
             return result;
         }
+
+        function initComponentDefine(path, options, callback)
+        {
+            $(document).ready(function ()
+            {
+                amdDefine = window.define;
+                if (typeof window.define !== "function" || !window.define.amd)
+                    throw "AMD is not present";
+                ComponentDefine.amd = true;
+                window.define = ComponentDefine;
+                if (verbose) console.log('Installed ComponentDefine method to auto register components');
+
+                callback = callback || defaultKnockoutPageLoader;
+                options = options || {};
+                options.root = true;
+                addComponent(path, options);
+                require([path], callback);
+            });
+        }
+
+        function defaultKnockoutPageLoader() 
+        {
+            var loaderView = $('#page-loader');
+            ko.applyBindings(ko.componentLoader, loaderView[0]);                
+        }
+
+        function ComponentDefine()
+        {
+            var args = Array.prototype.slice.call(arguments);
+            if (args.length !== 2 || !Array.isArray(args[0]) || typeof args[1] !== "function")
+            {
+                amdDefine.apply(null, args);     // does a simple pass through
+            }
+
+            // Captures results from AMD define method for component
+            var dependList = args[0], defineMethod = args[1];
+            amdDefine(dependList, function ()
+            {
+                var result = defineMethod.apply(this, Array.prototype.slice.call(arguments));
+                if (typeof result === "object" && typeof result.viewModel === "function" && result.template)
+                {
+                    var name = result.viewModel.name || result.viewModel.toString().match(/function (\w*)/)[1];
+                    if (verbose) console.log('Defining component ' + name);
+
+                    var options = result.component || {};
+                    options.name = options.name || camelCaseToDash(name);
+                    addComponent(null, options);
+
+                    dependList.forEach(function (path) { registerComponentPath(path); });            // register paths for all dependent components
+                }
+                return result;
+            });
+        }
     }
     
     function Reference(parent)
@@ -195,7 +271,7 @@
         self.childCompleted = childCompleted;
         self.refForItem = refForItem;
         self.refWrap = refWrap;
-        self.instance = function () { return self.viewModel; };
+        self.instance = ko.observable();
         self.dispose = dispose;
 
         return self;
@@ -221,7 +297,7 @@
         
         function addCompletedCallback(callback)
         {
-            var subscription = completedCallback.subscribe(function () { callback(self.viewModel, self); });
+            var subscription = completedCallback.subscribe(function () { callback(self.instance(), self); });
             subscriptions.push(subscription);
             return subscription;
         }
@@ -237,7 +313,7 @@
         function attached(viewModel)
         {
             isAttached = true;
-            self.viewModel = viewModel;
+            self.instance(viewModel);
             notify();
         }
         
