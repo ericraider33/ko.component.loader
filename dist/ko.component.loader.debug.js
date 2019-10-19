@@ -44,7 +44,7 @@
 
     function buildLoader(xOptions, xExports)
     {
-        var self = xExports || {}, loadedCallback, verbose, amdDefine;
+        var self = xExports || {}, loadedCallback, verbose, amdDefine, cssLoaded = [], popState;
 
         self.loading = ko.observable(true);
         self.components = ko.observableArray([]);
@@ -60,6 +60,9 @@
         self.isVerbose = function () { return verbose; };
         self.Reference = Reference;
         self.initComponentDefine = initComponentDefine;
+        self.pathToName = pathToName;
+        self.getJsonFromUrl = getJsonFromUrl;
+        self.pushState = pushState;
 
         if (typeof xOptions === "object")
             setOptions(xOptions);
@@ -71,6 +74,7 @@
         {
             options = options || {};
             options.params = options.params || {};
+            path = path || options.path;
 
             var name = options.name || camelCaseToDash(path.replace(/^.*\//, ''));
             var component = findComponent(name);
@@ -81,11 +85,12 @@
                 component.noWait = typeof options.noWait !== "undefined" ? options.noWait : component.noWait;
                 component.root = typeof options.root !== "undefined" ? options.root : component.root;
                 component.dialog = typeof options.dialog !== "undefined" ? options.dialog : component.dialog;
+                component.css = typeof options.css !== "undefined" ? options.css : component.css;
                 component.params = $.extend(component.params, options.params);
             }
             else
             {
-                component = { name: name, params: options.params, path: path, isLoaded: false, noWait: !!options.noWait, root: !!options.root, registered: false, dialog: options.dialog };
+                component = { name: name, params: options.params, path: path, isLoaded: false, noWait: !!options.noWait, root: !!options.root, registered: false, dialog: options.dialog, css: options.css };
                 self.components.push(component);
             }
 
@@ -93,6 +98,19 @@
             {
                 ko.components.register(name, { require: component.path });
                 component.registered = true;
+            }
+
+            if (component.css)
+            {
+                var cssList = typeof component.css == "string" ? [component.css] : component.css;
+                cssList.forEach(function (css)
+                {
+                    if (cssLoaded.indexOf(css) >= 0)
+                        return;
+
+                    cssLoaded.push(css);
+                    $('head').append('<link type="text/css" href="' + css + '" rel="stylesheet"/>');
+                });
             }
 
             if ((component.root || component.dialog) && !component.params.ref)
@@ -104,9 +122,14 @@
                 self.dialogs.push(component);
         }
 
+        function pathToName(requirePath)
+        {
+            return camelCaseToDash(requirePath.replace(/^.*\//, ''));
+        }
+
         function registerComponentPath(path)
         {
-            var name = camelCaseToDash(path.replace(/^.*\//, ''));
+            var name = pathToName(path);
             var component = findComponent(name);
             if (!component || component.registered)
                 return;
@@ -152,6 +175,15 @@
                 loadedCallback(self);
             else if (root && root.viewModel && typeof root.viewModel.handleOnLoaded === "function")
                 root.viewModel.handleOnLoaded(self);
+
+            $(document).trigger('ko.component.loader:loaded');
+            window.status = "loaded";
+
+            if (popState)
+            {
+                registerPopstate();
+                handlePopState(null, getJsonFromUrl(), self.ref);
+            }
         }
 
         function findComponent(name)
@@ -179,6 +211,7 @@
             if (options.headLess) self.ref.attached(self);      // loader isn't bound using KO
             if (typeof options.verbose !== "undefined") verbose = options.verbose ? true : false;
             if (typeof options.loadedCallback === "function") loadedCallback = options.loadedCallback;
+            if (typeof options.popState === "boolean") popState = options.popState;
             return self;
         }
 
@@ -199,42 +232,66 @@
             return result;
         }
 
-        function initComponentDefine(path, options, callback)
+        function initComponentDefine(path, compOptions, methOptions)
         {
+            amdDefine = window.define;
+            if (typeof window.define !== "function" || !window.define.amd)
+                throw "AMD is not present";
+            ComponentDefine.amd = true;
+            window.define = ComponentDefine;
+            if (verbose) console.log('Installed ComponentDefine method to auto register components');
+
+            compOptions = compOptions || {};
+            compOptions.root = true;
+            addComponent(path, compOptions);
+
+            methOptions = methOptions || {};
+            methOptions.callback = methOptions.callback || defaultKnockoutPageLoader;
+
+            if (methOptions.components)
+                methOptions.components.forEach(function (componentPath) { addComponent(componentPath); });
+            if (methOptions.popState)
+                registerPopstate();
+
+            var toRequire = (methOptions.components || []).slice();
+            toRequire.push(path);
+
             $(document).ready(function ()
             {
-                amdDefine = window.define;
-                if (typeof window.define !== "function" || !window.define.amd)
-                    throw "AMD is not present";
-                ComponentDefine.amd = true;
-                window.define = ComponentDefine;
-                if (verbose) console.log('Installed ComponentDefine method to auto register components');
-
-                callback = callback || defaultKnockoutPageLoader;
-                options = options || {};
-                options.root = true;
-                addComponent(path, options);
-                require([path], callback);
+                require(toRequire, methOptions.callback);
             });
         }
 
         function defaultKnockoutPageLoader() 
         {
-            var loaderView = $('#page-loader');
-            ko.applyBindings(ko.componentLoader, loaderView[0]);                
+            ko.applyBindings(ko.componentLoader);
         }
 
         function ComponentDefine()
         {
-            var args = Array.prototype.slice.call(arguments);
-            if (args.length !== 2 || !Array.isArray(args[0]) || typeof args[1] !== "function")
+            var dependList, defineMethod, args = Array.prototype.slice.call(arguments);
+            if (args.length === 2 && Array.isArray(args[0]) && typeof args[1] === "function")
+            {
+                dependList = args[0];
+                defineMethod = args[1];
+
+                // Captures results from AMD define method for component
+                amdDefine(dependList, amdCallback);
+            }
+            else if (args.length === 3 && typeof args[0] === "string" && Array.isArray(args[1]) && typeof args[2] === "function")
+            {
+                dependList = args[1];
+                defineMethod = args[2];
+
+                // Captures results from AMD define method for component
+                amdDefine(args[0], dependList, amdCallback);
+            }
+            else if (args.length !== 2 || !Array.isArray(args[0]) || typeof args[1] !== "function")
             {
                 amdDefine.apply(null, args);     // does a simple pass through
             }
 
-            // Captures results from AMD define method for component
-            var dependList = args[0], defineMethod = args[1];
-            amdDefine(dependList, function ()
+            function amdCallback() 
             {
                 var result = defineMethod.apply(this, Array.prototype.slice.call(arguments));
                 if (typeof result === "object" && typeof result.viewModel === "function" && result.template)
@@ -249,7 +306,60 @@
                     dependList.forEach(function (path) { registerComponentPath(path); });            // register paths for all dependent components
                 }
                 return result;
+            }
+        }
+
+        function registerPopstate()
+        {
+            window.addEventListener('popstate', function (event)
+            {
+                var urlParams = getJsonFromUrl();
+                handlePopState(event, urlParams, self.ref);
             });
+        }
+
+        function handlePopState(event, urlParams, top)
+        {
+            for (var i = 0; i < top.children.length; i++)
+            {
+                var child = top.children[i];
+                var instance = child.instance();
+                if (instance && typeof instance.handlePopState === "function")
+                    instance.handlePopState(event, urlParams);
+
+                handlePopState(event, urlParams, child);
+            }
+        }
+
+        function getJsonFromUrl()
+        {
+            var result = {};
+            if (!location.search) return result;
+            var query = location.search.substr(1);
+            query.split("&").forEach(function (part)
+            {
+                var item = part.split("=");
+                result[item[0]] = decodeURIComponent(item[1]);
+            });
+            return result;
+        }
+
+        function pushState(values, args)
+        {
+            args = args || {};
+
+            var qParams = $.extend(getJsonFromUrl(), values);
+            for (var key in qParams)
+                if (qParams.hasOwnProperty(key) && qParams[key] === null)
+                    delete qParams[key];
+
+            var qText = $.param(qParams);
+            var url = window.location.origin + window.location.pathname + (qText.length === 0 ? "" : "?" + qText);
+
+            if (window.history && args.replaceState)
+                window.history.replaceState({}, '', url);
+            else if (window.history)
+                window.history.pushState({}, '', url);
         }
     }
     
@@ -258,12 +368,12 @@
         var self = this;
         var initialCompleted = false;
         var isAttached = false;
-        var children = 0;
         var childrenComplete = 0;
         var completedCallback = ko.observable(self);
         var subscriptions = [];
 
         self.child = child;
+        self.children = [];
         self.attached = attached;
         self.setComponentName = setComponentName;
         self.setOptions = setOptions;
@@ -278,8 +388,9 @@
         
         function child(args)
         {
-            children++;
-            return new Reference(self).setOptions(args || {});
+            var toAdd = new Reference(self).setOptions(args || {});
+            self.children.push(toAdd);
+            return toAdd;
         }
         
         function setOptions(args)
@@ -325,8 +436,8 @@
         
         function notify()
         {
-            if (ko.componentLoader.isVerbose()) console.log('Notify ' + self.componentName + ' isAttached=' + isAttached + ' children=' + children + ' complete=' + childrenComplete);            
-            if (!isAttached || childrenComplete !== children || initialCompleted)
+            if (ko.componentLoader.isVerbose()) console.log('Notify ' + self.componentName + ' isAttached=' + isAttached + ' children=' + self.children.length + ' complete=' + childrenComplete);            
+            if (!isAttached || childrenComplete !== self.children.length || initialCompleted)
                 return;
 
             initialCompleted = true;
